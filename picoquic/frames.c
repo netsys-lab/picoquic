@@ -1075,13 +1075,56 @@ void picoquic_stream_data_callback(picoquic_cnx_t* cnx, picoquic_stream_head_t* 
 {
     picoquic_stream_data_node_t* data;
 
+    /* Check if we need to skip any dropped ranges at the beginning */
+    if (stream->deadline_ctx != NULL && stream->deadline_ctx->receiver_dropped_ranges.ack_tree.root != NULL) {
+        uint64_t skipped_to = picoquic_skip_dropped_ranges(&stream->deadline_ctx->receiver_dropped_ranges, stream->consumed_offset);
+        if (skipped_to > stream->consumed_offset) {
+            /* Notify application about the gap */
+            uint64_t gap_length = skipped_to - stream->consumed_offset;
+            if (cnx->callback_fn != NULL) {
+                (cnx->callback_fn)(cnx, stream->stream_id, (uint8_t*)&gap_length, sizeof(gap_length),
+                    picoquic_callback_stream_gap, cnx->callback_ctx, stream);
+            }
+            stream->consumed_offset = skipped_to;
+        }
+    }
+
     while ((data = (picoquic_stream_data_node_t*)picosplay_first(&stream->stream_data_tree)) != NULL && data->offset <= stream->consumed_offset) {
         size_t start = (size_t)(stream->consumed_offset - data->offset);
         if (data->length >= start) {
             size_t data_length = data->length - start;
+            uint64_t data_end = stream->consumed_offset + data_length;
+            
+            /* Check if there's a gap within this data chunk */
+            if (stream->deadline_ctx != NULL && stream->deadline_ctx->receiver_dropped_ranges.ack_tree.root != NULL) {
+                uint64_t next_dropped = picoquic_skip_dropped_ranges(&stream->deadline_ctx->receiver_dropped_ranges, stream->consumed_offset);
+                if (next_dropped > stream->consumed_offset && next_dropped < data_end) {
+                    /* Deliver data up to the gap */
+                    data_length = (size_t)(next_dropped - stream->consumed_offset);
+                }
+            }
+            
             picoquic_stream_data_chunk_callback(cnx, stream, data->bytes + start, data_length);
+            
+            /* Check if we need to skip a gap after this data */
+            if (stream->deadline_ctx != NULL && stream->deadline_ctx->receiver_dropped_ranges.ack_tree.root != NULL) {
+                uint64_t skipped_to = picoquic_skip_dropped_ranges(&stream->deadline_ctx->receiver_dropped_ranges, stream->consumed_offset);
+                if (skipped_to > stream->consumed_offset) {
+                    /* Notify application about the gap */
+                    uint64_t gap_length = skipped_to - stream->consumed_offset;
+                    if (cnx->callback_fn != NULL) {
+                        (cnx->callback_fn)(cnx, stream->stream_id, (uint8_t*)&gap_length, sizeof(gap_length),
+                            picoquic_callback_stream_gap, cnx->callback_ctx, stream);
+                    }
+                    stream->consumed_offset = skipped_to;
+                }
+            }
         }
-        picosplay_delete_hint(&stream->stream_data_tree, &data->stream_data_node);
+        
+        /* Only delete the node if we've consumed all of it */
+        if (stream->consumed_offset >= data->offset + data->length) {
+            picosplay_delete_hint(&stream->stream_data_tree, &data->stream_data_node);
+        }
     }
 
     /* handle the case where the fin frame does not carry any data */
@@ -1343,6 +1386,11 @@ const uint8_t* picoquic_decode_stream_frame(picoquic_cnx_t* cnx, const uint8_t* 
 
 picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, picoquic_path_t * path_x)
 {
+    /* Use EDF scheduler if deadline-aware streams are enabled */
+    if (cnx->deadline_context != NULL && cnx->deadline_context->deadline_scheduling_active) {
+        return picoquic_find_ready_stream_edf(cnx, path_x);
+    }
+    
     picoquic_stream_head_t* first_stream = cnx->first_output_stream;
     picoquic_stream_head_t* stream = first_stream;
     picoquic_stream_head_t* found_stream = NULL;
@@ -1756,6 +1804,11 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                 size_t start_index = 0;
 
                 byte_index = bytes - bytes0;
+
+                /* Skip any dropped data due to expired deadlines */
+                if (stream->deadline_ctx != NULL) {
+                    picoquic_skip_dropped_stream_data(stream);
+                }
 
                 if (stream->send_queue == NULL) {
                     length = 0;
@@ -3658,6 +3711,14 @@ static int picoquic_process_ack_range(
     return ret;
 }
 
+/* Forward declarations for receive timestamp functions */
+static const uint8_t* picoquic_decode_receive_timestamps(picoquic_cnx_t* cnx, const uint8_t* bytes,
+    const uint8_t* bytes_max, uint64_t current_time, uint64_t largest_acknowledged,
+    picoquic_ack_context_t* ack_ctx);
+
+static uint8_t* picoquic_encode_receive_timestamps(picoquic_cnx_t* cnx, uint8_t* bytes,
+    uint8_t* bytes_max, picoquic_ack_context_t* ack_ctx, uint64_t largest_acknowledged);
+
 const uint8_t* picoquic_decode_ack_frame(picoquic_cnx_t* cnx, const uint8_t* bytes,
     const uint8_t* bytes_max, uint64_t current_time, int epoch, int is_ecn, int has_path_id, picoquic_packet_data_t* packet_data)
 {
@@ -3807,6 +3868,24 @@ const uint8_t* picoquic_decode_ack_frame(picoquic_cnx_t* cnx, const uint8_t* byt
                 &ack_state, current_time);
         }
     }
+    
+    /* Parse receive timestamps if present and enabled */
+    if (bytes != NULL && epoch > picoquic_epoch_0rtt &&
+        cnx->remote_parameters.max_receive_timestamps_per_ack > 0) {
+        /* Get the appropriate ack context */
+        picoquic_ack_context_t* ack_ctx_for_ts = &cnx->ack_ctx[pc];
+        if (cnx->is_multipath_enabled && pc == picoquic_packet_context_application && pkt_ctx != NULL) {
+            /* For multipath, use the path-specific ack context */
+            for (int path_id = 0; path_id < cnx->nb_paths; path_id++) {
+                if (&cnx->path[path_id]->pkt_ctx == pkt_ctx) {
+                    ack_ctx_for_ts = &cnx->path[path_id]->ack_ctx;
+                    break;
+                }
+            }
+        }
+        bytes = picoquic_decode_receive_timestamps(cnx, bytes, bytes_max, current_time,
+            largest, ack_ctx_for_ts);
+    }
 
     return bytes;
 }
@@ -3934,6 +4013,20 @@ uint8_t* picoquic_format_ack_frame_in_context(picoquic_cnx_t* cnx, uint8_t* byte
                 *after_stamp = picoquic_frame_type_ack;
             }
         }
+        
+        /* Encode receive timestamps if enabled and in 1-RTT packets */
+        if (bytes > after_stamp && cnx->local_parameters.max_receive_timestamps_per_ack > 0 &&
+            multipath_sequence == UINT64_MAX) { /* Only in 1-RTT packets */
+            uint8_t* bytes_ts = bytes;
+            bytes = picoquic_encode_receive_timestamps(cnx, bytes, bytes_max, ack_ctx, 
+                picoquic_sack_list_last(&ack_ctx->sack_list));
+            if (bytes == NULL) {
+                /* Not enough space for timestamps */
+                bytes = bytes_ts;
+                *more_data = 1;
+                *after_stamp = picoquic_frame_type_ack;
+            }
+        }
     }
 
     if (bytes > after_stamp){
@@ -4002,6 +4095,178 @@ uint8_t * picoquic_format_ack_frame(picoquic_cnx_t* cnx, uint8_t* bytes, uint8_t
             current_time, &cnx->ack_ctx[pc], &need_time_stamp, UINT64_MAX, is_opportunistic);
     }
 
+    return bytes;
+}
+
+/* Helper functions for receive timestamps per draft-smith-quic-receive-ts-02 */
+
+static const uint8_t* picoquic_decode_receive_timestamps(picoquic_cnx_t* cnx, const uint8_t* bytes,
+    const uint8_t* bytes_max, uint64_t current_time, uint64_t largest_acknowledged,
+    picoquic_ack_context_t* ack_ctx)
+{
+    uint64_t timestamp_range_count = 0;
+    
+    /* Check if receive timestamps are enabled */
+    if (cnx->remote_parameters.max_receive_timestamps_per_ack == 0) {
+        return bytes;
+    }
+    
+    /* Decode timestamp range count */
+    if ((bytes = picoquic_frames_varint_decode(bytes, bytes_max, &timestamp_range_count)) == NULL) {
+        picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR, 
+            picoquic_frame_type_ack);
+        return NULL;
+    }
+    
+    /* Process each timestamp range */
+    uint64_t total_timestamps = 0;
+    uint64_t current_packet_number = largest_acknowledged;
+    uint64_t previous_timestamp = cnx->receive_timestamp_basis;
+    
+    for (uint64_t i = 0; i < timestamp_range_count; i++) {
+        uint64_t delta_largest_acknowledged = 0;
+        uint64_t timestamp_delta_count = 0;
+        
+        /* Decode delta largest acknowledged */
+        if ((bytes = picoquic_frames_varint_decode(bytes, bytes_max, &delta_largest_acknowledged)) == NULL) {
+            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR, 
+                picoquic_frame_type_ack);
+            return NULL;
+        }
+        
+        /* Decode timestamp delta count */
+        if ((bytes = picoquic_frames_varint_decode(bytes, bytes_max, &timestamp_delta_count)) == NULL) {
+            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR, 
+                picoquic_frame_type_ack);
+            return NULL;
+        }
+        
+        /* Check against max_receive_timestamps_per_ack limit */
+        total_timestamps += timestamp_delta_count;
+        if (total_timestamps > cnx->remote_parameters.max_receive_timestamps_per_ack) {
+            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, 
+                picoquic_frame_type_ack);
+            return NULL;
+        }
+        
+        /* Calculate the packet number for this range */
+        if (delta_largest_acknowledged > current_packet_number) {
+            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR, 
+                picoquic_frame_type_ack);
+            return NULL;
+        }
+        current_packet_number = largest_acknowledged - delta_largest_acknowledged;
+        
+        /* Process timestamp deltas for this range */
+        for (uint64_t j = 0; j < timestamp_delta_count; j++) {
+            uint64_t timestamp_delta = 0;
+            
+            if ((bytes = picoquic_frames_varint_decode(bytes, bytes_max, &timestamp_delta)) == NULL) {
+                picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR, 
+                    picoquic_frame_type_ack);
+                return NULL;
+            }
+            
+            /* Decode timestamp using the exponent */
+            uint64_t timestamp = previous_timestamp + 
+                (timestamp_delta << cnx->remote_parameters.receive_timestamps_exponent);
+            
+            /* TODO: Store the timestamp for packet number current_packet_number - j */
+            /* For now we just parse without storing */
+            
+            previous_timestamp = timestamp;
+        }
+    }
+    
+    return bytes;
+}
+
+static uint8_t* picoquic_encode_receive_timestamps(picoquic_cnx_t* cnx, uint8_t* bytes,
+    uint8_t* bytes_max, picoquic_ack_context_t* ack_ctx, uint64_t largest_acknowledged)
+{
+    /* Check if receive timestamps are enabled */
+    if (cnx->local_parameters.max_receive_timestamps_per_ack == 0 ||
+        cnx->remote_parameters.receive_timestamps_exponent > 20) {
+        /* No timestamp ranges to encode */
+        bytes = picoquic_frames_varint_encode(bytes, bytes_max, 0);
+        return bytes;
+    }
+    
+    /* Count timestamp ranges to encode */
+    uint64_t timestamp_range_count = 0;
+    uint8_t* range_count_ptr = bytes;
+    
+    /* Reserve space for range count */
+    bytes = picoquic_frames_varint_encode(bytes, bytes_max, 0);
+    if (bytes == NULL) {
+        return NULL;
+    }
+    
+    /* Iterate through SACK items to encode timestamps */
+    picoquic_sack_item_t* sack = picoquic_sack_last_item(&ack_ctx->sack_list);
+    uint64_t max_ranges = cnx->local_parameters.max_receive_timestamps_per_ack;
+    uint64_t exponent = cnx->remote_parameters.receive_timestamps_exponent;
+    
+    while (sack != NULL && timestamp_range_count < max_ranges && bytes < bytes_max) {
+        if (sack->receive_timestamps != NULL && sack->receive_timestamps_count > 0) {
+            /* Find packets with timestamps in this range */
+            uint64_t range_start = sack->start_of_sack_range;
+            uint64_t range_end = sack->end_of_sack_range;
+            
+            /* Check for packets with actual timestamps */
+            int has_timestamps = 0;
+            for (size_t i = 0; i < sack->receive_timestamps_count; i++) {
+                if (sack->receive_timestamps[i] != 0) {
+                    has_timestamps = 1;
+                    break;
+                }
+            }
+            
+            if (has_timestamps) {
+                /* Encode delta largest acknowledged */
+                uint64_t delta = largest_acknowledged - range_end;
+                bytes = picoquic_frames_varint_encode(bytes, bytes_max, delta);
+                
+                /* Count timestamps in this range */
+                uint64_t ts_count = 0;
+                uint8_t* ts_count_ptr = bytes;
+                bytes = picoquic_frames_varint_encode(bytes, bytes_max, 0);
+                
+                if (bytes != NULL && bytes < bytes_max) {
+                    /* Encode timestamps */
+                    uint64_t prev_timestamp = cnx->receive_timestamp_basis;
+                    
+                    for (uint64_t pn = range_end; pn >= range_start && bytes < bytes_max; pn--) {
+                        size_t index = (size_t)(pn - range_start);
+                        if (index < sack->receive_timestamps_count && 
+                            sack->receive_timestamps[index] != 0) {
+                            /* Calculate timestamp delta */
+                            uint64_t ts = sack->receive_timestamps[index];
+                            uint64_t ts_delta = (ts - prev_timestamp) >> exponent;
+                            
+                            bytes = picoquic_frames_varint_encode(bytes, bytes_max, ts_delta);
+                            prev_timestamp = ts;
+                            ts_count++;
+                        }
+                        
+                        if (pn == 0) break; /* Avoid underflow */
+                    }
+                    
+                    /* Update timestamp count */
+                    if (bytes != NULL) {
+                        picoquic_frames_varint_encode(ts_count_ptr, bytes_max, ts_count);
+                        timestamp_range_count++;
+                    }
+                }
+            }
+        }
+        
+        sack = picoquic_sack_previous_item(sack);
+    }
+    
+    /* Update range count */
+    picoquic_frames_varint_encode(range_count_ptr, bytes_max, timestamp_range_count);
+    
     return bytes;
 }
 
@@ -6630,6 +6895,28 @@ int picoquic_decode_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x, const 
                             ack_needed = 1;
                             bytes = picoquic_decode_observed_address_frame(cnx, bytes, bytes_max, path_x, frame_id64);
                             break;
+                        case picoquic_frame_type_deadline_control:
+                            if (!cnx->local_parameters.enable_deadline_aware_streams ||
+                                !cnx->remote_parameters.enable_deadline_aware_streams) {
+                                DBG_PRINTF("DEADLINE_CONTROL frame (0x%x) not negotiated", (int)frame_id64);
+                                picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, frame_id64);
+                                bytes = NULL;
+                            } else {
+                                bytes = picoquic_parse_deadline_control_frame(cnx, bytes0, bytes_max, current_time, epoch);
+                                ack_needed = 1;
+                            }
+                            break;
+                        case picoquic_frame_type_stream_data_dropped:
+                            if (!cnx->local_parameters.enable_deadline_aware_streams ||
+                                !cnx->remote_parameters.enable_deadline_aware_streams) {
+                                DBG_PRINTF("STREAM_DATA_DROPPED frame (0x%x) not negotiated", (int)frame_id64);
+                                picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, frame_id64);
+                                bytes = NULL;
+                            } else {
+                                bytes = picoquic_parse_stream_data_dropped_frame(cnx, bytes0, bytes_max, current_time);
+                                ack_needed = 1;
+                            }
+                            break;
                         default:
                             /* Not implemented yet! */
                             picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, frame_id64);
@@ -6687,6 +6974,19 @@ static const uint8_t* picoquic_skip_crypto_hs_frame(const uint8_t* bytes, const 
 {
     if ((bytes = picoquic_frames_varint_skip(bytes+1, bytes_max)) != NULL) {
         bytes = picoquic_frames_length_data_skip(bytes, bytes_max);
+    }
+    return bytes;
+}
+
+/*
+ * Skip deadline control frame
+ */
+static const uint8_t* picoquic_skip_deadline_control_frame(const uint8_t* bytes, const uint8_t* bytes_max)
+{
+    /* Skip stream ID */
+    if ((bytes = picoquic_frames_varint_skip(bytes, bytes_max)) != NULL) {
+        /* Skip deadline */
+        bytes = picoquic_frames_varint_skip(bytes, bytes_max);
     }
     return bytes;
 }
@@ -6955,6 +7255,14 @@ int picoquic_skip_frame(const uint8_t* bytes, size_t bytes_maxsize, size_t* cons
                 case picoquic_frame_type_observed_address_v4:
                 case picoquic_frame_type_observed_address_v6:
                     bytes = picoquic_skip_observed_address_frame(bytes, bytes_max, frame_id64);
+                    *pure_ack = 0;
+                    break;
+                case picoquic_frame_type_deadline_control:
+                    bytes = picoquic_skip_deadline_control_frame(bytes, bytes_max);
+                    *pure_ack = 0;
+                    break;
+                case picoquic_frame_type_stream_data_dropped:
+                    bytes = picoquic_skip_stream_data_dropped_frame(bytes, bytes_max);
                     *pure_ack = 0;
                     break;
                 default:

@@ -440,6 +440,19 @@ int picoquic_prepare_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
         bytes = picoquic_transport_param_type_varint_encode(bytes, bytes_max, picoquic_tp_enable_time_stamp,
             cnx->local_parameters.enable_time_stamp);
     }
+    
+    /* Encode receive timestamp extension parameters */
+    if (cnx->local_parameters.max_receive_timestamps_per_ack > 0 && bytes != NULL) {
+        bytes = picoquic_transport_param_type_varint_encode(bytes, bytes_max, 
+            picoquic_tp_max_receive_timestamps_per_ack,
+            cnx->local_parameters.max_receive_timestamps_per_ack);
+    }
+    
+    if (cnx->local_parameters.receive_timestamps_exponent > 0 && bytes != NULL) {
+        bytes = picoquic_transport_param_type_varint_encode(bytes, bytes_max,
+            picoquic_tp_receive_timestamps_exponent,
+            cnx->local_parameters.receive_timestamps_exponent);
+    }
 
     if (cnx->local_parameters.do_grease_quic_bit && bytes != NULL) {
         bytes = picoquic_transport_param_type_flag_encode(bytes, bytes_max, picoquic_tp_grease_quic_bit);
@@ -464,6 +477,12 @@ int picoquic_prepare_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
         bytes = picoquic_transport_param_type_varint_encode(bytes, bytes_max,
             picoquic_tp_address_discovery,
             (uint64_t)(cnx->local_parameters.address_discovery_mode - 1));
+    }
+
+    /* Encode deadline aware streams parameter */
+    if (cnx->local_parameters.enable_deadline_aware_streams && bytes != NULL) {
+        bytes = picoquic_transport_param_type_flag_encode(bytes, bytes_max,
+            picoquic_tp_enable_deadline_aware_streams);
     }
 
     /* This test extension must be the last one in the encoding, as it consumes all the available space */
@@ -757,6 +776,24 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
                     }
                     break;
                 }
+                case picoquic_tp_max_receive_timestamps_per_ack: {
+                    cnx->remote_parameters.max_receive_timestamps_per_ack =
+                        picoquic_transport_param_varint_decode(cnx, bytes + byte_index, extension_length, &ret);
+                    break;
+                }
+                case picoquic_tp_receive_timestamps_exponent: {
+                    uint64_t exponent =
+                        picoquic_transport_param_varint_decode(cnx, bytes + byte_index, extension_length, &ret);
+                    if (ret == 0) {
+                        if (exponent > 20) {
+                            ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_PARAMETER_ERROR, 0, 
+                                "Receive timestamps exponent too large");
+                        } else {
+                            cnx->remote_parameters.receive_timestamps_exponent = (uint8_t)exponent;
+                        }
+                    }
+                    break;
+                }
                 case picoquic_tp_grease_quic_bit:
                     if (extension_length != 0) {
                         ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_PARAMETER_ERROR, 0, "Grease TP");
@@ -827,6 +864,13 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
                     }
                     break;
                 }
+                case picoquic_tp_enable_deadline_aware_streams:
+                    if (extension_length != 0) {
+                        ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_PARAMETER_ERROR, 0, "Deadline aware streams TP");
+                    } else {
+                        cnx->remote_parameters.enable_deadline_aware_streams = 1;
+                    }
+                    break;
                 default:
                     /* ignore unknown extensions */
                     break;
@@ -976,6 +1020,12 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
     /* ACK Frequency is only enabled on server if negotiated by client */
     if (!cnx->client_mode && !cnx->is_ack_frequency_negotiated) {
         cnx->local_parameters.min_ack_delay = 0;
+    }
+
+    /* Initialize deadline context if deadline-aware streams are negotiated */
+    if (cnx->local_parameters.enable_deadline_aware_streams && 
+        cnx->remote_parameters.enable_deadline_aware_streams) {
+        picoquic_init_deadline_context(cnx);
     }
 
     *consumed = byte_index;

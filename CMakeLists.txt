@@ -77,10 +77,12 @@ endif()
 set(PICOQUIC_LIBRARY_FILES
     picoquic/bbr.c
     picoquic/bbr1.c
+    picoquic/bbr_deadline.c
     picoquic/bytestream.c
     picoquic/cc_common.c
     picoquic/config.c
     picoquic/cubic.c
+    picoquic/deadline.c
     picoquic/ech.c
     picoquic/fastcc.c
     picoquic/frames.c
@@ -167,6 +169,22 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/cplusplus.cpp
     picoquictest/cpu_limited.c
     picoquictest/datagram_tests.c
+    picoquictest/deadline_test.c
+    picoquictest/deadline_edf_test.c
+    picoquictest/deadline_partial_reliability_test.c
+    picoquictest/deadline_path_selection_test.c
+    picoquictest/deadline_packet_tracking_test.c
+    picoquictest/deadline_smart_retransmit_test.c
+    picoquictest/deadline_fairness_test.c
+    picoquictest/deadline_integration_test.c
+    picoquictest/deadline_basic_e2e_test.c
+    picoquictest/deadline_e2e_test.c
+    picoquictest/deadline_ack_test.c
+    picoquictest/bbr_deadline_test.c
+    picoquictest/bbr_deadline_e2e_test.c
+    picoquictest/deadline_comprehensive_e2e_test.c
+    picoquictest/deadline_per_chunk_test.c
+    picoquictest/deadline_per_chunk_verify_test.c
     picoquictest/delay_tolerant_test.c
     picoquictest/ech_test.c
     picoquictest/edge_cases.c
@@ -191,6 +209,7 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/pn2pn64test.c
     picoquictest/qlog_test.c
     picoquictest/quic_tester.c
+    picoquictest/receive_timestamp_test.c
     picoquictest/sacktest.c
     picoquictest/satellite_test.c
     picoquictest/skip_frame_test.c

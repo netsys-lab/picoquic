@@ -250,6 +250,17 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
                 stream_data->length = length;
                 stream_data->offset = 0;
                 stream_data->next_stream_data = NULL;
+                
+                /* Set per-chunk deadline if stream has deadline enabled */
+                stream_data->enqueue_time = picoquic_get_quic_time(cnx->quic);
+                if (stream->deadline_ctx != NULL && stream->deadline_ctx->deadline_enabled) {
+                    /* Each chunk gets its own deadline based on when it was enqueued */
+                    stream_data->chunk_deadline = stream_data->enqueue_time + 
+                        (stream->deadline_ctx->deadline_ms * 1000);
+                } else {
+                    /* No deadline for this chunk */
+                    stream_data->chunk_deadline = UINT64_MAX;
+                }
 
                 while (next != NULL) {
                     pprevious = &next->next_stream_data;
@@ -1134,6 +1145,11 @@ void picoquic_finalize_and_protect_packet(picoquic_cnx_t *cnx,
         packet->delivered_app_limited = (cnx->cnx_state < picoquic_state_ready || path_x->delivered_limited_index != 0);
         if (path_x->bytes_in_transit >= path_x->cwin && cnx->cnx_state == picoquic_state_ready) {
             packet->sent_cwin_limited = 1;
+        }
+
+        /* Update packet deadline information after all stream data has been added */
+        if (cnx->local_parameters.enable_deadline_aware_streams) {
+            picoquic_update_packet_deadline_info(cnx, packet, current_time);
         }
 
         switch (packet->ptype) {
@@ -3919,6 +3935,11 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
 
     if (ret == 0) {
         ret = picoquic_check_cc_feedback_timer(cnx, &next_wake_time, current_time);
+    }
+
+    /* Check stream deadlines if deadline-aware streams are enabled */
+    if (ret == 0 && cnx->deadline_context != NULL && cnx->deadline_context->deadline_aware_enabled) {
+        picoquic_check_stream_deadlines(cnx, current_time);
     }
 
     if (send_buffer_max < PICOQUIC_ENFORCED_INITIAL_MTU) {

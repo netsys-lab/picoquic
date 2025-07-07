@@ -167,7 +167,9 @@ typedef enum {
     picoquic_frame_type_paths_blocked = 0x15228c0d,
     picoquic_frame_type_path_cid_blocked = 0x15228c0e,
     picoquic_frame_type_observed_address_v4 = 0x9f81a6,
-    picoquic_frame_type_observed_address_v6 = 0x9f81a7
+    picoquic_frame_type_observed_address_v6 = 0x9f81a7,
+    picoquic_frame_type_deadline_control = 0xff0b002, /* per draft-tjohn-quic-multipath-dmtp-01 */
+    picoquic_frame_type_stream_data_dropped = 0xff0b003 /* signals dropped data ranges to receiver */
 } picoquic_frame_type_enum_t;
 
 /* PMTU discovery requirement status */
@@ -376,6 +378,9 @@ typedef struct st_picoquic_stream_queue_node_t {
     uint64_t offset;  /* Stream offset of the first octet in "bytes" */
     size_t length;    /* Number of octets in "bytes" */
     uint8_t* bytes;
+    /* Deadline-aware fields for per-chunk deadlines */
+    uint64_t enqueue_time;     /* Time when this chunk was added (microseconds) */
+    uint64_t chunk_deadline;   /* Absolute deadline for this chunk (microseconds) */
 } picoquic_stream_queue_node_t;
 
 /*
@@ -407,6 +412,10 @@ typedef struct st_picoquic_packet_t {
     uint64_t data_repeat_stream_id;
     uint64_t data_repeat_stream_offset;
     size_t data_repeat_stream_data_length;
+    
+    /* Deadline tracking for smart retransmission */
+    uint64_t earliest_deadline;      /* Earliest deadline among all streams in packet */
+    uint8_t contains_deadline_data;  /* Whether packet contains deadline stream data */
 
     size_t length;
     size_t checksum_overhead;
@@ -594,6 +603,9 @@ typedef uint64_t picoquic_tp_enum;
 #define picoquic_tp_enable_bdp_frame 0xebd9 /* per draft-kuhn-quic-0rtt-bdp-09 */
 #define picoquic_tp_initial_max_path_id 0x0f739bbc1b666d0dull /* per draft quic multipath 13 */ 
 #define picoquic_tp_address_discovery 0x9f81a176 /* per draft-seemann-quic-address-discovery */
+#define picoquic_tp_max_receive_timestamps_per_ack 0xff0a002ull /* per draft-smith-quic-receive-ts-02 */
+#define picoquic_tp_receive_timestamps_exponent 0xff0a003ull /* per draft-smith-quic-receive-ts-02 */
+#define picoquic_tp_enable_deadline_aware_streams 0xff0b001ull /* per draft-tjohn-quic-multipath-dmtp-01 */
 
 /* Callback for converting binary log to quic log at the end of a connection. 
  * This is kept private for now; and will only be set through the "set quic log"
@@ -766,6 +778,9 @@ typedef struct st_picoquic_sack_item_t {
     uint64_t end_of_sack_range;
     uint64_t time_created;
     int nb_times_sent[2];
+    /* Receive timestamps for packets in this range - NULL if not collecting timestamps */
+    uint64_t* receive_timestamps;
+    size_t receive_timestamps_count;
 } picoquic_sack_item_t;
 
 typedef struct st_picoquic_sack_range_count_t {
@@ -778,6 +793,72 @@ typedef struct st_picoquic_sack_list_t {
     int64_t horizon_delay;
     picoquic_sack_range_count_t rc[2];
 } picoquic_sack_list_t;
+
+/*
+ * Deadline-aware stream structures
+ */
+
+typedef void (*picoquic_deadline_missed_fn)(picoquic_cnx_t* cnx, uint64_t stream_id, void* ctx);
+
+typedef struct st_picoquic_stream_deadline_t {
+    uint64_t deadline_ms;           /* Relative deadline in milliseconds */
+    uint64_t absolute_deadline;     /* Absolute deadline timestamp */
+    uint8_t deadline_type;          /* 0: soft, 1: hard */
+    uint8_t deadline_enabled;       /* Whether deadline is active */
+    
+    /* Partial reliability tracking */
+    uint64_t last_dropped_offset;   /* Last offset dropped due to deadline */
+    uint64_t dropped_ranges_count;  /* Number of dropped ranges */
+    picoquic_sack_list_t dropped_ranges; /* SACK-like list of dropped ranges at sender */
+    picoquic_sack_list_t receiver_dropped_ranges; /* Ranges dropped by sender, tracked at receiver */
+    
+    /* Statistics */
+    uint64_t bytes_dropped;         /* Total bytes dropped */
+    uint64_t deadlines_missed;      /* Number of missed deadlines */
+} picoquic_stream_deadline_t;
+
+typedef struct st_picoquic_deadline_context_t {
+    uint8_t deadline_aware_enabled;     /* Negotiated support */
+    uint8_t deadline_scheduling_active; /* Whether EDF is active */
+    
+    /* Scheduling state */
+    struct st_picoquic_stream_head_t* deadline_queue; /* Priority queue of streams */
+    uint64_t next_deadline_check;       /* Next time to check deadlines */
+    
+    /* Callbacks */
+    picoquic_deadline_missed_fn on_deadline_missed;
+    void* deadline_callback_ctx;
+    
+    /* Path metrics for deadline streams */
+    struct {
+        uint64_t deadline_streams_sent;      /* Total deadline streams sent on path */
+        uint64_t deadline_streams_met;       /* Streams that met their deadline */
+        uint64_t total_deadline_bytes;       /* Total bytes sent for deadline streams */
+        uint64_t path_switches_for_deadline; /* Times path was switched for deadline */
+        uint64_t last_deadline_success_time; /* Last successful deadline delivery */
+    } path_metrics[16]; /* Support up to 16 paths */
+    
+    /* Fairness tracking for preventing starvation */
+    uint64_t deadline_bytes_sent;
+    uint64_t non_deadline_bytes_sent;
+    uint64_t window_start_time;
+    uint64_t last_non_deadline_scheduled;
+    
+    /* Fairness configuration */
+    double min_non_deadline_share;  /* e.g., 0.2 (20%) */
+    uint64_t max_starvation_time;   /* e.g., 50ms */
+    
+    /* Deadline class tracking */
+    uint64_t class_bytes[4];        /* URGENT, NORMAL, RELAXED, NONE */
+    uint64_t class_last_scheduled[4];
+} picoquic_deadline_context_t;
+
+typedef struct st_picoquic_path_deadline_metrics_t {
+    uint64_t estimated_one_way_delay;   /* Estimated OWD in microseconds */
+    uint64_t owd_variance;              /* Variance for reliability estimation */
+    uint64_t last_owd_update;           /* Timestamp of last update */
+    uint8_t owd_reliable;               /* Whether OWD estimate is reliable */
+} picoquic_path_deadline_metrics_t;
 
 /*
  * Stream head.
@@ -848,6 +929,8 @@ typedef struct st_picoquic_stream_head_t {
     unsigned int is_output_stream : 1; /* If stream is listed in the output list */
     unsigned int is_closed : 1; /* Stream is closed, closure is accouted for */
     unsigned int is_discarded : 1; /* There should be no more callback for that stream, the application has discarded it */
+    /* Deadline-aware stream extension */
+    picoquic_stream_deadline_t* deadline_ctx; /* Deadline context, NULL if not deadline-aware */
 } picoquic_stream_head_t;
 
 #define IS_CLIENT_STREAM_ID(id) (unsigned int)(((id) & 1) == 0)
@@ -1242,6 +1325,8 @@ typedef struct st_picoquic_path_t {
     uint8_t ip_client_remote[16];
     uint8_t ip_client_remote_length;
     
+    /* Deadline-aware path metrics */
+    picoquic_path_deadline_metrics_t deadline_metrics;
 } picoquic_path_t;
 
 /* Crypto context. There are four such contexts:
@@ -1382,6 +1467,8 @@ typedef struct st_picoquic_cnx_t {
 
     uint64_t start_time;
     int64_t phase_delay;
+    /* Receive timestamp basis per draft-smith-quic-receive-ts-02 */
+    uint64_t receive_timestamp_basis;
     uint64_t application_error;
     uint64_t local_error;
     char const * local_error_reason;
@@ -1558,6 +1645,9 @@ typedef struct st_picoquic_cnx_t {
     char* binlog_file_name;
     void (*memlog_call_back)(picoquic_cnx_t* cnx, picoquic_path_t* path, void* v_memlog, int op_code, uint64_t current_time);
     void *memlog_ctx;
+    
+    /* Deadline-aware stream context */
+    picoquic_deadline_context_t* deadline_context;
 } picoquic_cnx_t;
 
 typedef struct st_picoquic_packet_data_t {
@@ -1829,8 +1919,13 @@ int picoquic_record_pn_received(picoquic_cnx_t* cnx, picoquic_packet_context_enu
 void picoquic_sack_select_ack_ranges(picoquic_sack_list_t* sack_list, picoquic_sack_item_t* first_sack,
     int max_ranges, int is_opportunistic, int* nb_sent_max, int* nb_sent_max_skip);
 
+void picoquic_sack_list_init(picoquic_sack_list_t* sack_list);
+void picoquic_sack_list_free(picoquic_sack_list_t* sack_list);
+
 int picoquic_update_sack_list(picoquic_sack_list_t* sack,
     uint64_t pn64_min, uint64_t pn64_max, uint64_t current_time);
+int picoquic_update_sack_list_ex(picoquic_sack_list_t* sack,
+    uint64_t pn64_min, uint64_t pn64_max, uint64_t current_time, uint64_t receive_timestamp);
 /* Check whether the data fills a hole. returns 0 if it does, -1 otherwise. */
 int picoquic_check_sack_list(picoquic_sack_list_t* sack,
     uint64_t pn64_min, uint64_t pn64_max);
@@ -1930,6 +2025,35 @@ uint8_t* picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head_
     uint8_t* bytes, uint8_t* bytes_max, int* more_data, int* is_pure_ack, int* is_still_active, int* ret);
 
 void picoquic_update_max_stream_ID_local(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream);
+
+/* Deadline-aware stream management */
+void picoquic_deadline_stream_init(picoquic_stream_head_t* stream);
+void picoquic_deadline_stream_free(picoquic_stream_head_t* stream);
+void picoquic_init_deadline_context(picoquic_cnx_t* cnx);
+void picoquic_free_deadline_context(picoquic_cnx_t* cnx);
+int picoquic_set_stream_deadline(picoquic_cnx_t* cnx, uint64_t stream_id, uint64_t deadline_ms, int is_hard);
+int picoquic_queue_deadline_control_frame(picoquic_cnx_t* cnx, uint64_t stream_id, uint64_t deadline_ms);
+const uint8_t* picoquic_parse_deadline_control_frame(picoquic_cnx_t* cnx, const uint8_t* bytes, 
+    const uint8_t* bytes_max, uint64_t current_time, int epoch);
+uint8_t* picoquic_format_deadline_control_frame(uint8_t* bytes, uint8_t* bytes_max,
+    uint64_t stream_id, uint64_t deadline_ms);
+int picoquic_can_meet_deadline(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream,
+    picoquic_path_t* path, uint64_t current_time);
+picoquic_path_t* picoquic_select_path_for_deadline(picoquic_cnx_t* cnx,
+    picoquic_stream_head_t* stream, uint64_t current_time);
+void picoquic_check_stream_deadlines(picoquic_cnx_t* cnx, uint64_t current_time);
+picoquic_stream_head_t* picoquic_find_ready_stream_edf(picoquic_cnx_t* cnx, picoquic_path_t* path_x);
+int picoquic_is_stream_data_dropped(picoquic_stream_head_t* stream, uint64_t offset, uint64_t length);
+void picoquic_skip_dropped_stream_data(picoquic_stream_head_t* stream);
+int picoquic_queue_stream_data_dropped_frame(picoquic_cnx_t* cnx, uint64_t stream_id,
+    uint64_t offset, uint64_t length);
+const uint8_t* picoquic_parse_stream_data_dropped_frame(picoquic_cnx_t* cnx,
+    const uint8_t* bytes, const uint8_t* bytes_max, uint64_t current_time);
+const uint8_t* picoquic_skip_stream_data_dropped_frame(const uint8_t* bytes, const uint8_t* bytes_max);
+uint64_t picoquic_skip_dropped_ranges(picoquic_sack_list_t* dropped_ranges, uint64_t offset);
+void picoquic_update_packet_deadline_info(picoquic_cnx_t* cnx, picoquic_packet_t* packet, uint64_t current_time);
+int picoquic_should_skip_packet_retransmit(picoquic_cnx_t* cnx, picoquic_packet_t* packet, uint64_t current_time);
+picoquic_path_t* picoquic_select_path_for_retransmit(picoquic_cnx_t* cnx, picoquic_packet_t* packet, uint64_t current_time);
 
 /* Handling of retransmission of frames.
  * When a packet is deemed lost, the code looks at the frames that it contained and
@@ -2110,6 +2234,8 @@ int picoquic_prepare_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
 
 int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mode,
     uint8_t* bytes, size_t bytes_max, size_t* consumed);
+
+uint8_t* picoquic_transport_param_type_flag_encode(uint8_t* bytes, const uint8_t* bytes_max, picoquic_tp_enum tp_type);
 
 picoquic_misc_frame_header_t* picoquic_create_misc_frame(const uint8_t* bytes, size_t length, int is_pure_ack,
     picoquic_packet_context_enum pc);
