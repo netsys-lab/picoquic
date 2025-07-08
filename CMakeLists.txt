@@ -167,6 +167,12 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/cplusplus.cpp
     picoquictest/cpu_limited.c
     picoquictest/datagram_tests.c
+    picoquictest/deadline_api_test.c
+    picoquictest/deadline_simple_eval.c
+    picoquictest/multipath_comprehensive_eval.c
+    picoquictest/deadline_priority_test.c
+    picoquictest/deadline_stream_abort_test.c
+    picoquictest/deadline_stream_test.c
     picoquictest/delay_tolerant_test.c
     picoquictest/ech_test.c
     picoquictest/edge_cases.c
@@ -180,6 +186,7 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/memlog_test.c
     picoquictest/minicrypto_test.c
     picoquictest/multipath_test.c
+    picoquictest/multipath_deadline_test.c
     picoquictest/netperf_test.c
     picoquictest/openssl_test.c
     picoquictest/p2p_test.c

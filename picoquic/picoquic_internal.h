@@ -376,6 +376,7 @@ typedef struct st_picoquic_stream_queue_node_t {
     uint64_t offset;  /* Stream offset of the first octet in "bytes" */
     size_t length;    /* Number of octets in "bytes" */
     uint8_t* bytes;
+    uint64_t enqueue_time;  /* When this chunk was added (microseconds) - for deadline tracking */
 } picoquic_stream_queue_node_t;
 
 /*
@@ -594,6 +595,7 @@ typedef uint64_t picoquic_tp_enum;
 #define picoquic_tp_enable_bdp_frame 0xebd9 /* per draft-kuhn-quic-0rtt-bdp-09 */
 #define picoquic_tp_initial_max_path_id 0x0f739bbc1b666d0dull /* per draft quic multipath 13 */ 
 #define picoquic_tp_address_discovery 0x9f81a176 /* per draft-seemann-quic-address-discovery */
+#define picoquic_tp_enable_deadline_aware_streams 0xff20 /* per draft-tjohn-quic-multipath-dmtp-01, using private use range */
 
 /* Callback for converting binary log to quic log at the end of a connection. 
  * This is kept private for now; and will only be set through the "set quic log"
@@ -848,6 +850,11 @@ typedef struct st_picoquic_stream_head_t {
     unsigned int is_output_stream : 1; /* If stream is listed in the output list */
     unsigned int is_closed : 1; /* Stream is closed, closure is accouted for */
     unsigned int is_discarded : 1; /* There should be no more callback for that stream, the application has discarded it */
+    /* Deadline-aware stream fields */
+    uint64_t deadline_ms;           /* Relative deadline in ms (0 = no deadline) */
+    uint64_t expired_bytes;         /* Total bytes that missed deadline */
+    uint64_t expiry_threshold_abs;  /* Absolute byte threshold */
+    uint8_t  expiry_threshold_pct;  /* Percentage threshold (0-100) */
 } picoquic_stream_head_t;
 
 #define IS_CLIENT_STREAM_ID(id) (unsigned int)(((id) & 1) == 0)
@@ -1334,6 +1341,8 @@ typedef struct st_picoquic_cnx_t {
     unsigned int is_address_discovery_receiver : 1; /* receive the address discovery extension */
     unsigned int is_subscribed_to_path_allowed : 1; /* application wants to be advised if it is now possible to create a path */
     unsigned int is_notified_that_path_is_allowed : 1; /* application wants to be advised if it is now possible to create a path */
+    unsigned int enable_deadline_aware_streams : 1; /* DMTP: deadline-aware streams negotiated */
+    unsigned int is_bbr_required : 1; /* BBR congestion control should be enforced after handshake */
     
     /* PMTUD policy */
     picoquic_pmtud_policy_enum pmtud_policy;
@@ -1619,6 +1628,7 @@ uint8_t* picoquic_prepare_path_challenge_frames(picoquic_cnx_t* cnx, picoquic_pa
     uint64_t current_time, uint64_t* next_wake_time); 
 void picoquic_select_next_path_tuple(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t* next_wake_time,
     picoquic_path_t** next_path, picoquic_tuple_t** next_tuple);
+picoquic_path_t* picoquic_select_path_for_deadline(picoquic_cnx_t* cnx, uint64_t deadline_absolute, uint64_t current_time);
 int picoquic_renew_connection_id(picoquic_cnx_t* cnx, int path_id);
 void picoquic_delete_path(picoquic_cnx_t* cnx, int path_index);
 void picoquic_demote_path(picoquic_cnx_t* cnx, int path_index, uint64_t current_time, uint64_t reason, char const * phrase);
@@ -1908,6 +1918,11 @@ picoquic_stream_head_t* picoquic_create_stream(picoquic_cnx_t* cnx, uint64_t str
 picoquic_stream_head_t* picoquic_create_missing_streams(picoquic_cnx_t* cnx, uint64_t stream_id, int is_remote);
 int picoquic_is_stream_closed(picoquic_stream_head_t* stream, int client_mode);
 int picoquic_delete_stream_if_closed(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream);
+int picoquic_is_stream_deadline_aware(picoquic_stream_head_t* stream);
+uint8_t calculate_deadline_priority(picoquic_stream_head_t* stream, picoquic_cnx_t* cnx);
+void picoquic_track_expired_bytes(picoquic_stream_head_t* stream, size_t bytes_sent, uint64_t current_time);
+int picoquic_should_abort_deadline_stream(picoquic_stream_head_t* stream);
+int picoquic_should_retransmit_for_deadline(picoquic_cnx_t* cnx, uint64_t stream_id, uint64_t offset, size_t length);
 
 void picoquic_update_stream_initial_remote(picoquic_cnx_t* cnx);
 

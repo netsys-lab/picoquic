@@ -26,6 +26,7 @@
 #include "picoquic_internal.h"
 #include "picoquic_unified_log.h"
 #include "tls_api.h"
+#include "picoquic_bbr.h"
 #include <string.h>
 
 uint64_t picoquic_transport_param_varint_decode(picoquic_cnx_t * cnx, uint8_t* bytes, uint64_t extension_length, int* ret) 
@@ -466,6 +467,11 @@ int picoquic_prepare_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
             (uint64_t)(cnx->local_parameters.address_discovery_mode - 1));
     }
 
+    if (cnx->local_parameters.enable_deadline_aware_streams != 0 && bytes != NULL) {
+        bytes = picoquic_transport_param_type_flag_encode(bytes, bytes_max,
+            picoquic_tp_enable_deadline_aware_streams);
+    }
+
     /* This test extension must be the last one in the encoding, as it consumes all the available space */
     if (extension_mode == 1 && !cnx->test_large_chello &&
         cnx->quic->test_large_server_flight && bytes != NULL){
@@ -523,6 +529,7 @@ void picoquic_clear_transport_extensions(picoquic_cnx_t* cnx)
     cnx->remote_parameters.do_grease_quic_bit = 0;
     cnx->remote_parameters.enable_bdp_frame = 0;
     cnx->remote_parameters.initial_max_path_id = 0;
+    cnx->remote_parameters.enable_deadline_aware_streams = 0;
 }
 
 int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mode,
@@ -827,6 +834,15 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
                     }
                     break;
                 }
+                case picoquic_tp_enable_deadline_aware_streams:
+                    if (extension_length != 0) {
+                        ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_PARAMETER_ERROR, 0, 
+                            "Enable deadline aware streams TP");
+                    }
+                    else {
+                        cnx->remote_parameters.enable_deadline_aware_streams = 1;
+                    }
+                    break;
                 default:
                     /* ignore unknown extensions */
                     break;
@@ -976,6 +992,15 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
     /* ACK Frequency is only enabled on server if negotiated by client */
     if (!cnx->client_mode && !cnx->is_ack_frequency_negotiated) {
         cnx->local_parameters.min_ack_delay = 0;
+    }
+
+    /* If deadline-aware streams are negotiated, mark for BBR enforcement later */
+    if (picoquic_is_deadline_aware_negotiated(cnx)) {
+        /* Don't change congestion control during transport parameter processing
+         * as it may disrupt the handshake. Mark for later processing. */
+        cnx->is_bbr_required = 1;
+        DBG_PRINTF("%s:%u:%s: DMTP negotiated, marking for BBR congestion control\n", 
+                   __FILE__, __LINE__, __func__);
     }
 
     *consumed = byte_index;
